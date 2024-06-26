@@ -1,0 +1,579 @@
+/*
+ *  Copyright 2021 Collate
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+package org.openmetadata.csv;
+
+import static org.openmetadata.common.utils.CommonUtil.listOf;
+import static org.openmetadata.common.utils.CommonUtil.listOrEmpty;
+import static org.openmetadata.common.utils.CommonUtil.nullOrEmpty;
+import static org.openmetadata.csv.CsvUtil.FIELD_SEPARATOR;
+import static org.openmetadata.csv.CsvUtil.recordToString;
+
+import java.io.IOException;
+import java.io.Reader;
+import java.io.StringReader;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import javax.ws.rs.core.Response;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVFormat.Builder;
+import org.apache.commons.csv.CSVPrinter;
+import org.apache.commons.csv.CSVRecord;
+import org.apache.commons.lang3.tuple.Pair;
+import org.jdbi.v3.sqlobject.transaction.Transaction;
+import org.openmetadata.common.utils.CommonUtil;
+import org.openmetadata.schema.EntityInterface;
+import org.openmetadata.schema.type.ApiStatus;
+import org.openmetadata.schema.type.EntityReference;
+import org.openmetadata.schema.type.Include;
+import org.openmetadata.schema.type.TagLabel;
+import org.openmetadata.schema.type.TagLabel.TagSource;
+import org.openmetadata.schema.type.csv.CsvDocumentation;
+import org.openmetadata.schema.type.csv.CsvErrorType;
+import org.openmetadata.schema.type.csv.CsvFile;
+import org.openmetadata.schema.type.csv.CsvHeader;
+import org.openmetadata.schema.type.csv.CsvImportResult;
+import org.openmetadata.service.Entity;
+import org.openmetadata.service.jdbi3.EntityRepository;
+import org.openmetadata.service.util.EntityUtil;
+import org.openmetadata.service.util.JsonUtils;
+import org.openmetadata.service.util.RestUtil.PutResponse;
+import org.openmetadata.service.util.ValidatorUtil;
+
+/**
+ * EntityCsv provides export and import capabilities for an entity. Each entity must implement the
+ * abstract methods to provide entity specific processing functionality to export an entity to a CSV
+ * record, and import an entity from a CSV record.
+ */
+@Slf4j
+public abstract class EntityCsv<T extends EntityInterface> {
+  public static final String FIELD_ERROR_MSG = "#%s: Field %d error - %s";
+  public static final String IMPORT_STATUS_HEADER = "status";
+  public static final String IMPORT_STATUS_DETAILS = "details";
+  public static final String IMPORT_SUCCESS = "success";
+  public static final String IMPORT_FAILED = "failure";
+  public static final String IMPORT_SKIPPED = "skipped";
+  public static final String ENTITY_CREATED = "Entity created";
+  public static final String ENTITY_UPDATED = "Entity updated";
+  private final String entityType;
+  private final List<CsvHeader> csvHeaders;
+  private final List<String> expectedHeaders;
+  private final CsvImportResult importResult = new CsvImportResult();
+  protected boolean processRecord; // When set to false record processing is discontinued
+  protected final Map<String, T> dryRunCreatedEntities = new HashMap<>();
+  private final String importedBy;
+  protected int recordIndex = 0;
+
+  protected EntityCsv(String entityType, List<CsvHeader> csvHeaders, String importedBy) {
+    this.entityType = entityType;
+    this.csvHeaders = csvHeaders;
+    this.expectedHeaders = CsvUtil.getHeaders(csvHeaders);
+    this.importedBy = importedBy;
+  }
+
+  /** Import entities from a CSV file */
+  public final CsvImportResult importCsv(String csv, boolean dryRun) throws IOException {
+    importResult.withDryRun(dryRun);
+    StringWriter writer = new StringWriter();
+    CSVPrinter resultsPrinter = getResultsCsv(csvHeaders, writer);
+    if (resultsPrinter == null) {
+      return importResult;
+    }
+
+    // Parse CSV
+    List<CSVRecord> records = parse(csv);
+    if (records == null) {
+      return importResult; // Error during parsing
+    }
+
+    // First record is CSV header - Validate headers
+    if (!validateHeaders(records.get(recordIndex++))) {
+      return importResult;
+    }
+    importResult.withNumberOfRowsPassed(importResult.getNumberOfRowsPassed() + 1);
+
+    // Validate and load each record
+    while (recordIndex < records.size()) {
+      processRecord(resultsPrinter, records);
+    }
+
+    // Finally, create the entities parsed from the record
+    setFinalStatus();
+    importResult.withImportResultsCsv(writer.toString());
+    return importResult;
+  }
+
+  /** Implement this method to a CSV record and turn it into an entity */
+  protected abstract void createEntity(CSVPrinter resultsPrinter, List<CSVRecord> csvRecords)
+      throws IOException;
+
+  public final String exportCsv(T entity) throws IOException {
+    CsvFile csvFile = new CsvFile().withHeaders(csvHeaders);
+    addRecord(csvFile, entity);
+    return CsvUtil.formatCsv(csvFile);
+  }
+
+  public final String exportCsv(List<T> entities) throws IOException {
+    CsvFile csvFile = new CsvFile().withHeaders(csvHeaders);
+    for (T entity : entities) {
+      addRecord(csvFile, entity);
+    }
+    return CsvUtil.formatCsv(csvFile);
+  }
+
+  public static CsvDocumentation getCsvDocumentation(String entityType) {
+    LOG.info("Initializing CSV documentation for entity {}", entityType);
+    String path = String.format(".*json/data/%s/%sCsvDocumentation.json$", entityType, entityType);
+    try {
+      List<String> jsonDataFiles = EntityUtil.getJsonDataResources(path);
+      String json =
+          CommonUtil.getResourceAsStream(
+              EntityRepository.class.getClassLoader(), jsonDataFiles.get(0));
+      return JsonUtils.readValue(json, CsvDocumentation.class);
+    } catch (IOException e) {
+      LOG.error(
+          "FATAL - Failed to load CSV documentation for entity {} from the path {}",
+          entityType,
+          path);
+    }
+    return null;
+  }
+
+  /** Implement this method to export an entity into a list of fields to create a CSV record */
+  protected abstract void addRecord(CsvFile csvFile, T entity);
+
+  /** Implement this method to export an entity into a list of fields to create a CSV record */
+  public final void addRecord(CsvFile csvFile, List<String> recordList) {
+    List<List<String>> list = csvFile.getRecords();
+    list.add(recordList);
+    csvFile.withRecords(list);
+  }
+
+  /** Owner field is in entityType;entityName format */
+  public EntityReference getOwner(CSVPrinter printer, CSVRecord csvRecord, int fieldNumber)
+      throws IOException {
+    if (!processRecord) {
+      return null;
+    }
+
+    String ownerField = csvRecord.get(fieldNumber);
+    if (nullOrEmpty(ownerField)) {
+      return null;
+    }
+
+    List<String> list = CsvUtil.fieldToStrings(ownerField);
+    if (list.size() != 2) {
+      importFailure(printer, invalidOwner(fieldNumber), csvRecord);
+      return null;
+    }
+    EntityReference owner =
+        getEntityReference(printer, csvRecord, fieldNumber, list.get(0), list.get(1));
+    return owner == null || Boolean.TRUE.equals(owner.getInherited()) ? null : owner;
+  }
+
+  /** Owner field is in entityName format */
+  public EntityReference getOwnerAsUser(CSVPrinter printer, CSVRecord csvRecord, int fieldNumber)
+      throws IOException {
+    if (!processRecord) {
+      return null;
+    }
+    String owner = csvRecord.get(fieldNumber);
+    if (nullOrEmpty(owner)) {
+      return null;
+    }
+    return getEntityReference(printer, csvRecord, fieldNumber, Entity.USER, owner);
+  }
+
+  protected final Boolean getBoolean(CSVPrinter printer, CSVRecord csvRecord, int fieldNumber)
+      throws IOException {
+    String field = csvRecord.get(fieldNumber);
+    if (nullOrEmpty(field)) {
+      return null;
+    }
+    if (field.equals(Boolean.TRUE.toString())) {
+      return true;
+    }
+    if (field.equals(Boolean.FALSE.toString())) {
+      return false;
+    }
+    importFailure(printer, invalidBoolean(fieldNumber, field), csvRecord);
+    processRecord = false;
+    return false;
+  }
+
+  protected final EntityReference getEntityReference(
+      CSVPrinter printer, CSVRecord csvRecord, int fieldNumber, String entityType)
+      throws IOException {
+    if (!processRecord) {
+      return null;
+    }
+    String fqn = csvRecord.get(fieldNumber);
+    return getEntityReference(printer, csvRecord, fieldNumber, entityType, fqn);
+  }
+
+  protected EntityInterface getEntityByName(String entityType, String fqn) {
+    EntityInterface entity =
+        entityType.equals(this.entityType) ? dryRunCreatedEntities.get(fqn) : null;
+    if (entity == null) {
+      EntityRepository<?> entityRepository = Entity.getEntityRepository(entityType);
+      entity = entityRepository.findByNameOrNull(fqn, Include.NON_DELETED);
+    }
+    return entity;
+  }
+
+  protected final EntityReference getEntityReference(
+      CSVPrinter printer, CSVRecord csvRecord, int fieldNumber, String entityType, String fqn)
+      throws IOException {
+    if (nullOrEmpty(fqn)) {
+      return null;
+    }
+    EntityInterface entity = getEntityByName(entityType, fqn);
+    if (entity == null) {
+      importFailure(printer, entityNotFound(fieldNumber, entityType, fqn), csvRecord);
+      processRecord = false;
+      return null;
+    }
+    return entity.getEntityReference();
+  }
+
+  protected final List<EntityReference> getEntityReferences(
+      CSVPrinter printer, CSVRecord csvRecord, int fieldNumber, String entityType)
+      throws IOException {
+    if (!processRecord) {
+      return null;
+    }
+    String fqns = csvRecord.get(fieldNumber);
+    if (nullOrEmpty(fqns)) {
+      return null;
+    }
+    List<String> fqnList = listOrEmpty(CsvUtil.fieldToStrings(fqns));
+    List<EntityReference> refs = new ArrayList<>();
+    for (String fqn : fqnList) {
+      EntityReference ref = getEntityReference(printer, csvRecord, fieldNumber, entityType, fqn);
+      if (!processRecord) {
+        return null;
+      }
+      if (ref != null) {
+        refs.add(ref);
+      }
+    }
+    return refs.isEmpty() ? null : refs;
+  }
+
+  protected final List<TagLabel> getTagLabels(
+      CSVPrinter printer,
+      CSVRecord csvRecord,
+      List<Pair<Integer, TagSource>> fieldNumbersWithSource)
+      throws IOException {
+    if (!processRecord) {
+      return null;
+    }
+    List<TagLabel> tagLabels = new ArrayList<>();
+    for (Pair<Integer, TagSource> pair : fieldNumbersWithSource) {
+      int fieldNumbers = pair.getLeft();
+      TagSource source = pair.getRight();
+      List<EntityReference> refs =
+          source == TagSource.CLASSIFICATION
+              ? getEntityReferences(printer, csvRecord, fieldNumbers, Entity.TAG)
+              : getEntityReferences(printer, csvRecord, fieldNumbers, Entity.GLOSSARY_TERM);
+      if (processRecord && !nullOrEmpty(refs)) {
+        for (EntityReference ref : refs) {
+          tagLabels.add(new TagLabel().withSource(source).withTagFQN(ref.getFullyQualifiedName()));
+        }
+      }
+    }
+    return tagLabels;
+  }
+
+  public static String[] getResultHeaders(List<CsvHeader> csvHeaders) {
+    List<String> importResultsCsvHeader = listOf(IMPORT_STATUS_HEADER, IMPORT_STATUS_DETAILS);
+    importResultsCsvHeader.addAll(CsvUtil.getHeaders(csvHeaders));
+    return importResultsCsvHeader.toArray(new String[0]);
+  }
+
+  // Create a CSVPrinter to capture the import results
+  private CSVPrinter getResultsCsv(List<CsvHeader> csvHeaders, StringWriter writer) {
+    CSVFormat format =
+        Builder.create(CSVFormat.DEFAULT).setHeader(getResultHeaders(csvHeaders)).build();
+    try {
+      return new CSVPrinter(writer, format);
+    } catch (IOException e) {
+      documentFailure(failed(e.getMessage(), CsvErrorType.UNKNOWN));
+    }
+    return null;
+  }
+
+  private List<CSVRecord> parse(String csv) {
+    Reader in = new StringReader(csv);
+    try {
+      return CSVFormat.DEFAULT.parse(in).stream().toList();
+    } catch (IOException e) {
+      documentFailure(failed(e.getMessage(), CsvErrorType.PARSER_FAILURE));
+    }
+    return null;
+  }
+
+  private boolean validateHeaders(CSVRecord csvRecord) {
+    importResult.withNumberOfRowsProcessed((int) csvRecord.getRecordNumber());
+    if (expectedHeaders.equals(csvRecord.toList())) {
+      return true;
+    }
+    importResult.withNumberOfRowsFailed(1);
+    documentFailure(invalidHeader(recordToString(expectedHeaders), recordToString(csvRecord)));
+    return false;
+  }
+
+  private void processRecord(CSVPrinter resultsPrinter, List<CSVRecord> csvRecords)
+      throws IOException {
+    processRecord = true;
+    createEntity(resultsPrinter, csvRecords); // Convert record into entity for
+  }
+
+  public final CSVRecord getNextRecord(
+      CSVPrinter resultsPrinter, List<CsvHeader> csvHeaders, List<CSVRecord> csvRecords)
+      throws IOException {
+    CSVRecord csvRecord = csvRecords.get(recordIndex++);
+    // Every row must have total fields corresponding to the number of headers
+    if (csvHeaders.size() != csvRecord.size()) {
+      importFailure(
+          resultsPrinter, invalidFieldCount(expectedHeaders.size(), csvRecord.size()), csvRecord);
+      return null;
+    }
+
+    // Check if required values are present
+    List<String> errors = new ArrayList<>();
+    for (int i = 0; i < csvHeaders.size(); i++) {
+      String field = csvRecord.get(i);
+      boolean fieldRequired = Boolean.TRUE.equals(csvHeaders.get(i).getRequired());
+      if (fieldRequired && nullOrEmpty(field)) {
+        errors.add(fieldRequired(i));
+      }
+    }
+
+    if (!errors.isEmpty()) {
+      importFailure(resultsPrinter, String.join(FIELD_SEPARATOR, errors), csvRecord);
+      return null;
+    }
+    return csvRecord;
+  }
+
+  public final CSVRecord getNextRecord(CSVPrinter resultsPrinter, List<CSVRecord> csvRecords)
+      throws IOException {
+    return getNextRecord(resultsPrinter, csvHeaders, csvRecords);
+  }
+
+  @Transaction
+  protected void createEntity(CSVPrinter resultsPrinter, CSVRecord csvRecord, T entity)
+      throws IOException {
+    entity.setId(UUID.randomUUID());
+    entity.setUpdatedBy(importedBy);
+    entity.setUpdatedAt(System.currentTimeMillis());
+    EntityRepository<T> repository = (EntityRepository<T>) Entity.getEntityRepository(entityType);
+    Response.Status responseStatus;
+    String violations = ValidatorUtil.validate(entity);
+    if (violations != null) {
+      // JSON schema based validation failed for the entity
+      importFailure(resultsPrinter, violations, csvRecord);
+      return;
+    }
+    if (Boolean.FALSE.equals(importResult.getDryRun())) { // If not dry run, create the entity
+      try {
+        repository.prepareInternal(entity, false);
+        PutResponse<T> response = repository.createOrUpdate(null, entity);
+        responseStatus = response.getStatus();
+      } catch (Exception ex) {
+        importFailure(resultsPrinter, ex.getMessage(), csvRecord);
+        importResult.setStatus(ApiStatus.FAILURE);
+        return;
+      }
+    } else { // Dry run don't create the entity
+      repository.setFullyQualifiedName(entity);
+      responseStatus =
+          repository.findByNameOrNull(entity.getFullyQualifiedName(), Include.NON_DELETED) == null
+              ? Response.Status.CREATED
+              : Response.Status.OK;
+      // Track the dryRun created entities, as they may be referred by other entities being created
+      // during import
+      dryRunCreatedEntities.put(entity.getFullyQualifiedName(), entity);
+    }
+
+    if (Response.Status.CREATED.equals(responseStatus)) {
+      importSuccess(resultsPrinter, csvRecord, ENTITY_CREATED);
+    } else {
+      importSuccess(resultsPrinter, csvRecord, ENTITY_UPDATED);
+    }
+  }
+
+  @Transaction
+  protected void createUserEntity(CSVPrinter resultsPrinter, CSVRecord csvRecord, T entity)
+      throws IOException {
+    entity.setId(UUID.randomUUID());
+    entity.setUpdatedBy(importedBy);
+    entity.setUpdatedAt(System.currentTimeMillis());
+    EntityRepository<T> repository = (EntityRepository<T>) Entity.getEntityRepository(entityType);
+    Response.Status responseStatus;
+
+    List<String> violationList = new ArrayList<>();
+
+    String violations = ValidatorUtil.validate(entity);
+    if (violations != null && !violations.isEmpty()) {
+      violationList.addAll(
+          Arrays.asList(violations.substring(1, violations.length() - 1).split(", ")));
+    }
+
+    String userNameEmailViolation = "";
+
+    if (violations == null || violations.isEmpty()) {
+      userNameEmailViolation = ValidatorUtil.validateUserNameWithEmailPrefix(csvRecord);
+    } else if (!violations.contains("name must match \"^((?!::).)*$\"")
+        && !violations.contains("email must be a well-formed email address")) {
+      userNameEmailViolation = ValidatorUtil.validateUserNameWithEmailPrefix(csvRecord);
+    }
+
+    if (!userNameEmailViolation.isEmpty()) {
+      violationList.add(userNameEmailViolation);
+    }
+
+    if (!violationList.isEmpty()) {
+      // JSON schema based validation failed for the entity
+      importFailure(resultsPrinter, violationList.toString(), csvRecord);
+      return;
+    }
+
+    if (Boolean.FALSE.equals(importResult.getDryRun())) { // If not dry run, create the entity
+      try {
+        repository.prepareInternal(entity, false);
+        PutResponse<T> response = repository.createOrUpdate(null, entity);
+        responseStatus = response.getStatus();
+      } catch (Exception ex) {
+        importFailure(resultsPrinter, ex.getMessage(), csvRecord);
+        importResult.setStatus(ApiStatus.FAILURE);
+        return;
+      }
+    } else { // Dry run don't create the entity
+      repository.setFullyQualifiedName(entity);
+      responseStatus =
+          repository.findByNameOrNull(entity.getFullyQualifiedName(), Include.NON_DELETED) == null
+              ? Response.Status.CREATED
+              : Response.Status.OK;
+      // Track the dryRun created entities, as they may be referred by other entities being created
+      // during import
+      dryRunCreatedEntities.put(entity.getFullyQualifiedName(), entity);
+    }
+
+    if (Response.Status.CREATED.equals(responseStatus)) {
+      importSuccess(resultsPrinter, csvRecord, ENTITY_CREATED);
+    } else {
+      importSuccess(resultsPrinter, csvRecord, ENTITY_UPDATED);
+    }
+  }
+
+  public String failed(String exception, CsvErrorType errorType) {
+    return String.format("#%s: Failed to parse the CSV filed - reason %s", errorType, exception);
+  }
+
+  public static String invalidHeader(String expected, String actual) {
+    return String.format(
+        "#%s: Headers [%s] doesn't match [%s]", CsvErrorType.INVALID_HEADER, actual, expected);
+  }
+
+  public static String invalidFieldCount(int expectedFieldCount, int actualFieldCount) {
+    return String.format(
+        "#%s: Field count %d does not match the expected field count of %d",
+        CsvErrorType.INVALID_FIELD_COUNT, actualFieldCount, expectedFieldCount);
+  }
+
+  public static String fieldRequired(int field) {
+    return String.format("#%s: Field %d is required", CsvErrorType.FIELD_REQUIRED, field + 1);
+  }
+
+  public static String invalidField(int field, String error) {
+    return String.format(FIELD_ERROR_MSG, CsvErrorType.INVALID_FIELD, field + 1, error);
+  }
+
+  public static String entityNotFound(int field, String entityType, String fqn) {
+    String error = String.format("Entity %s of type %s not found", fqn, entityType);
+    return String.format(FIELD_ERROR_MSG, CsvErrorType.INVALID_FIELD, field + 1, error);
+  }
+
+  public static String columnNotFound(int field, String columnFqn) {
+    String error = String.format("Column %s not found", columnFqn);
+    return String.format(FIELD_ERROR_MSG, CsvErrorType.INVALID_FIELD, field + 1, error);
+  }
+
+  public static String invalidOwner(int field) {
+    String error = "Owner should be of format user;userName or team;teamName";
+    return String.format(FIELD_ERROR_MSG, CsvErrorType.INVALID_FIELD, field + 1, error);
+  }
+
+  public static String invalidBoolean(int field, String fieldValue) {
+    String error = String.format("Field %s should be either 'true' of 'false'", fieldValue);
+    return String.format(FIELD_ERROR_MSG, CsvErrorType.INVALID_FIELD, field + 1, error);
+  }
+
+  public static List<CsvHeader> resetRequiredColumns(
+      List<CsvHeader> headers, final List<String> columnNames) {
+    if (nullOrEmpty(columnNames)) {
+      return headers;
+    }
+    headers.forEach(
+        header -> {
+          if (columnNames.contains(header.getName())) {
+            header.withRequired(false);
+          }
+        });
+    return headers;
+  }
+
+  private void documentFailure(String error) {
+    importResult.withStatus(ApiStatus.ABORTED);
+    importResult.withAbortReason(error);
+  }
+
+  protected void importSuccess(CSVPrinter printer, CSVRecord inputRecord, String successDetails)
+      throws IOException {
+    List<String> recordList = listOf(IMPORT_SUCCESS, successDetails);
+    recordList.addAll(inputRecord.toList());
+    printer.printRecord(recordList);
+    importResult.withNumberOfRowsProcessed((int) inputRecord.getRecordNumber());
+    importResult.withNumberOfRowsPassed(importResult.getNumberOfRowsPassed() + 1);
+  }
+
+  protected void importFailure(CSVPrinter printer, String failedReason, CSVRecord inputRecord)
+      throws IOException {
+    List<String> recordList = listOf(IMPORT_FAILED, failedReason);
+    recordList.addAll(inputRecord.toList());
+    printer.printRecord(recordList);
+    importResult.withNumberOfRowsProcessed((int) inputRecord.getRecordNumber());
+    importResult.withNumberOfRowsFailed(importResult.getNumberOfRowsFailed() + 1);
+    processRecord = false;
+  }
+
+  private void setFinalStatus() {
+    ApiStatus status = ApiStatus.FAILURE;
+    if (importResult.getNumberOfRowsPassed().equals(importResult.getNumberOfRowsProcessed())) {
+      status = ApiStatus.SUCCESS;
+    } else if (importResult.getNumberOfRowsPassed() > 1) {
+      status = ApiStatus.PARTIAL_SUCCESS;
+    }
+    importResult.setStatus(status);
+  }
+
+  public record ImportResult(String result, CSVRecord record, String details) {}
+}
